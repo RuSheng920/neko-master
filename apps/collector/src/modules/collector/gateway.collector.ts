@@ -144,6 +144,10 @@ export function createCollector(
   const id = backendId || 0;
   const activeConnections = new Map<string, TrackedConnection>();
   const batchBuffer = new BatchBuffer();
+  // Track which connection IDs have been counted in the realtime store for the
+  // current flush interval. Each connection contributes connections=1 exactly once
+  // per flush interval, matching the BatchBuffer's per-minute deduplication semantics.
+  const countedConnectionIds = new Set<string>();
   let lastBroadcastTime = 0;
   const broadcastThrottleMs = 500;
   let flushInterval: NodeJS.Timeout | null = null;
@@ -205,12 +209,15 @@ export function createCollector(
       if (stats.hasTrafficUpdates && stats.trafficOk) {
         if (trafficDetailOk && trafficAggOk) {
           realtimeStore.clearTraffic(id);
+          countedConnectionIds.clear();
         } else if (trafficDetailOk && !trafficAggOk) {
           // Detail committed, agg failed: clear detail-side realtime only.
           realtimeStore.clearTrafficDimensions(id);
+          countedConnectionIds.clear();
         } else if (!trafficDetailOk && trafficAggOk) {
           // Agg committed, detail failed: clear summary-side realtime only.
           realtimeStore.clearTrafficSummary(id);
+          countedConnectionIds.clear();
         }
       }
 
@@ -345,6 +352,8 @@ export function createCollector(
               sourceIP,
               timestampMs: now,
             });
+            const isNewThisFlush = !countedConnectionIds.has(conn.id);
+            countedConnectionIds.add(conn.id);
             realtimeStore.recordTraffic(
               id,
               {
@@ -357,7 +366,7 @@ export function createCollector(
                 upload: conn.upload,
                 download: conn.download,
               },
-              1,
+              isNewThisFlush ? 1 : 0,
               now
             );
 
@@ -370,7 +379,7 @@ export function createCollector(
               };
               existingGeo.upload += conn.upload;
               existingGeo.download += conn.download;
-              existingGeo.connections += 1;
+              if (isNewThisFlush) existingGeo.connections += 1;
               geoBatchByIp.set(ip, existingGeo);
             }
 
@@ -402,6 +411,8 @@ export function createCollector(
               sourceIP: existing.sourceIP,
               timestampMs: now,
             });
+            const isNewThisFlush = !countedConnectionIds.has(conn.id);
+            countedConnectionIds.add(conn.id);
             realtimeStore.recordTraffic(
               id,
               {
@@ -414,7 +425,7 @@ export function createCollector(
                 upload: uploadDelta,
                 download: downloadDelta,
               },
-              1,
+              isNewThisFlush ? 1 : 0,
               now
             );
 
@@ -427,7 +438,7 @@ export function createCollector(
               };
               existingGeo.upload += uploadDelta;
               existingGeo.download += downloadDelta;
-              existingGeo.connections += 1;
+              if (isNewThisFlush) existingGeo.connections += 1;
               geoBatchByIp.set(existing.ip, existingGeo);
             }
 

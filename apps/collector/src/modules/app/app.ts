@@ -14,9 +14,8 @@ import type { RealtimeStore } from '../realtime/realtime.store.js';
 import { buildGatewayHeaders, getGatewayBaseUrl, isAgentBackendUrl, parseSurgeRule } from '@neko-master/shared';
 import type { TrafficUpdate } from '../db/db.js';
 import { SurgePolicySyncService } from '../surge/surge-policy-sync.js';
-import { getClickHouseWriter } from '../clickhouse/clickhouse.writer.js';
-import { shouldSkipSqliteStatsWrites } from '../stats/stats-write-mode.js';
-import type { GeoIPService, GeoLocation } from '../geo/geo.service.js';
+import type { GeoIPService } from '../geo/geo.service.js';
+import { BatchBuffer } from '../collector/batch-buffer.js';
 
 // Import modules
 import { BackendService, backendController } from '../backend/index.js';
@@ -122,6 +121,71 @@ export async function createApp(options: AppOptions) {
   // In-memory dedup for agent report requestIds — prevents double-counting on POST retry.
   // Keyed by requestId, value is the time it was first seen (ms). TTL: 5 minutes.
   const seenRequestIds = new Map<string, number>();
+
+  // Per-backend BatchBuffer for agent mode — mirrors direct mode's 30s batch window so that
+  // "connections" is counted as one event per (connection-key, minute) rather than one per
+  // 2-second agent report, keeping statistics semantically consistent with direct mode.
+  const agentBatchBuffers = new Map<number, BatchBuffer>();
+  // Per-backend set of connection keys seen in the realtime store for the current flush
+  // interval. Ensures each connection contributes connections=1 exactly once per flush
+  // interval, consistent with direct mode's countedConnectionIds deduplication.
+  const agentCountedByBackend = new Map<number, Set<string>>();
+  const AGENT_FLUSH_INTERVAL_MS = Math.max(
+    5_000,
+    Number.parseInt(process.env.AGENT_FLUSH_INTERVAL_MS || '30000', 10) || 30_000,
+  );
+
+  const flushAgentBuffer = async (backendId: number, buffer: BatchBuffer) => {
+    if (!buffer.hasPending()) return;
+    const stats = buffer.flush(db, geoService, backendId, 'Agent');
+
+    let trafficDetailOk = true;
+    let trafficAggOk = true;
+    if (stats.pendingTrafficWrite) {
+      try {
+        const outcome = await stats.pendingTrafficWrite;
+        trafficDetailOk = outcome.detailOk;
+        trafficAggOk = outcome.aggOk;
+      } catch {
+        trafficDetailOk = false;
+        trafficAggOk = false;
+      }
+    }
+
+    if (stats.hasTrafficUpdates && stats.trafficOk) {
+      if (trafficDetailOk && trafficAggOk) {
+        realtimeStore.clearTraffic(backendId);
+        agentCountedByBackend.delete(backendId);
+      } else if (trafficDetailOk && !trafficAggOk) {
+        realtimeStore.clearTrafficDimensions(backendId);
+        agentCountedByBackend.delete(backendId);
+      } else if (!trafficDetailOk && trafficAggOk) {
+        realtimeStore.clearTrafficSummary(backendId);
+        agentCountedByBackend.delete(backendId);
+      }
+    }
+
+    let countryWriteOk = true;
+    if (stats.pendingCountryWrite) {
+      try {
+        await stats.pendingCountryWrite;
+      } catch {
+        countryWriteOk = false;
+      }
+    }
+
+    if (stats.hasCountryUpdates && stats.countryOk && countryWriteOk) {
+      realtimeStore.clearCountries(backendId);
+    }
+  };
+
+  const agentFlushIntervalId = setInterval(() => {
+    for (const [backendId, buffer] of agentBatchBuffers) {
+      flushAgentBuffer(backendId, buffer).catch((err) => {
+        console.error(`[Agent:${backendId}] Periodic flush error:`, err);
+      });
+    }
+  }, AGENT_FLUSH_INTERVAL_MS);
   const REQUEST_ID_TTL_MS = 5 * 60 * 1000;
   function isDuplicateRequestId(id: string): boolean {
     const now = Date.now();
@@ -526,15 +590,16 @@ export async function createApp(options: AppOptions) {
       return { success: true, backendId, accepted: 0, dropped: picked.length };
     }
 
-    const clickHouseWriter = getClickHouseWriter();
-    // Use isHealthy() (not isEnabled()) so SQLite fallback activates when ClickHouse is failing
-    const skipSqliteStatsWrites = shouldSkipSqliteStatsWrites(clickHouseWriter.isHealthy());
-    if (!skipSqliteStatsWrites) {
-      db.batchUpdateTrafficStats(backendId, updates);
-    }
-    let pendingCHTrafficWrite: Promise<unknown> | undefined;
-    if (clickHouseWriter.isEnabled()) {
-      pendingCHTrafficWrite = clickHouseWriter.writeTrafficBatch(backendId, updates);
+    // Get or create the per-backend BatchBuffer for agent mode.
+    // This mirrors the BatchBuffer used by direct mode (gateway.collector.ts): updates are
+    // accumulated over ~30 seconds then flushed in one batch. The BatchBuffer deduplicates
+    // by (domain, ip, chain, minute) key, so a long-lived connection is counted once per
+    // minute instead of once per 2-second agent report — keeping connection counts
+    // semantically consistent with direct mode.
+    let agentBuffer = agentBatchBuffers.get(backendId);
+    if (!agentBuffer) {
+      agentBuffer = new BatchBuffer();
+      agentBatchBuffers.set(backendId, agentBuffer);
     }
 
     const geoBatchByIp = new Map<
@@ -547,24 +612,51 @@ export async function createApp(options: AppOptions) {
       }
     >();
 
+    // Get or create per-backend counted-connections set for the current flush interval.
+    // Mirrors countedConnectionIds in direct mode: each unique connection key contributes
+    // connections=1 exactly once per flush interval regardless of agent report frequency.
+    let agentCounted = agentCountedByBackend.get(backendId);
+    if (!agentCounted) {
+      agentCounted = new Set<string>();
+      agentCountedByBackend.set(backendId, agentCounted);
+    }
+
     for (const update of updates) {
+      // Connection key matches BatchBuffer's deduplication dimensions (minus minuteKey).
+      const connectionKey = `${update.domain}:${update.ip}:${update.chains.join(' > ')}:${update.sourceIP || ''}`;
+      const isNewThisFlush = !agentCounted.has(connectionKey);
+      agentCounted.add(connectionKey);
+
       if (update.ip && update.ip !== '0.0.0.0' && update.ip !== '::') {
         const existing = geoBatchByIp.get(update.ip);
         if (existing) {
           existing.upload += update.upload;
           existing.download += update.download;
-          existing.connections += 1;
+          if (isNewThisFlush) existing.connections += 1;
           existing.timestampMs = Math.max(existing.timestampMs, update.timestampMs || 0);
         } else {
           geoBatchByIp.set(update.ip, {
             upload: update.upload,
             download: update.download,
-            connections: 1,
+            connections: isNewThisFlush ? 1 : 0,
             timestampMs: update.timestampMs || Date.now(),
           });
         }
       }
 
+      // Accumulate in BatchBuffer for deferred DB write (clears realtime after flush).
+      agentBuffer.add(backendId, {
+        domain: update.domain,
+        ip: update.ip,
+        chain: update.chains[0] || 'DIRECT',
+        chains: update.chains,
+        rule: update.rule,
+        rulePayload: update.rulePayload,
+        upload: update.upload,
+        download: update.download,
+        sourceIP: update.sourceIP,
+        timestampMs: update.timestampMs,
+      });
 
       realtimeStore.recordTraffic(
         backendId,
@@ -578,23 +670,16 @@ export async function createApp(options: AppOptions) {
           upload: update.upload,
           download: update.download,
         },
-        1,
+        isNewThisFlush ? 1 : 0,
         update.timestampMs || Date.now(),
       );
     }
 
-    // Mirror flushBatch behavior in direct mode: clear realtime store after persisting to DB.
-    // Without this, stats queries would double-count (DB total + realtime total = 2x actual).
-    if (!skipSqliteStatsWrites) {
-      realtimeStore.clearTraffic(backendId);
-    }
-    if (pendingCHTrafficWrite) {
-      pendingCHTrafficWrite
-        .then(() => { realtimeStore.clearTraffic(backendId); })
-        .catch(() => {});
-    }
+    // DB write and realtimeStore.clearTraffic are deferred to the periodic flush interval,
+    // matching direct mode's batch semantics.
 
     if (geoBatchByIp.size > 0 && geoService) {
+      const capturedBuffer = agentBuffer;
       // Process in background without blocking the agent response
       Promise.all(
         Array.from(geoBatchByIp.entries()).map(async ([ip, stats]) => {
@@ -607,39 +692,24 @@ export async function createApp(options: AppOptions) {
         }),
       )
         .then((results) => {
-          const countryUpdates = results
-            .filter((r): r is { ip: string; stats: typeof r.stats; geo: GeoLocation } => r.geo !== null)
-            .map((r) => {
-              realtimeStore.recordCountryTraffic(
-                backendId,
-                r.geo,
-                r.stats.upload,
-                r.stats.download,
-                r.stats.connections,
-                r.stats.timestampMs,
-              );
-              return {
-                country: r.geo.country || 'Unknown',
-                countryName: r.geo.country_name || r.geo.country || 'Unknown',
-                continent: r.geo.continent || 'Unknown',
-                upload: r.stats.upload,
-                download: r.stats.download,
-                timestampMs: r.stats.timestampMs,
-              };
+          for (const r of results) {
+            if (r.geo === null) continue;
+            realtimeStore.recordCountryTraffic(
+              backendId,
+              r.geo,
+              r.stats.upload,
+              r.stats.download,
+              r.stats.connections,
+              r.stats.timestampMs,
+            );
+            // Queue in buffer; DB write and clearCountries happen on next periodic flush.
+            capturedBuffer.addGeoResult({
+              ip: r.ip,
+              geo: r.geo,
+              upload: r.stats.upload,
+              download: r.stats.download,
+              timestampMs: r.stats.timestampMs,
             });
-
-          if (countryUpdates.length > 0) {
-            if (!skipSqliteStatsWrites) {
-              db.batchUpdateCountryStats(backendId, countryUpdates);
-              realtimeStore.clearCountries(backendId);
-            }
-            if (clickHouseWriter.isEnabled()) {
-              clickHouseWriter.writeCountryBatch(backendId, countryUpdates)
-                .then(() => { realtimeStore.clearCountries(backendId); })
-                .catch((err) => {
-                  console.error(`[Agent:${backendId}] ClickHouse country batch write failed:`, err);
-                });
-            }
           }
         })
         .catch((err) => {
@@ -1143,6 +1213,18 @@ export async function createApp(options: AppOptions) {
     
     if (!verifyResult.valid) {
       return reply.status(401).send({ error: verifyResult.message || 'Invalid token' });
+    }
+  });
+
+  // On server close: flush all pending agent buffers and stop the flush interval.
+  app.addHook('onClose', async () => {
+    clearInterval(agentFlushIntervalId);
+    for (const [backendId, buffer] of agentBatchBuffers) {
+      try {
+        await flushAgentBuffer(backendId, buffer);
+      } catch (err) {
+        console.error(`[Agent:${backendId}] Final flush error on close:`, err);
+      }
     }
   });
 
