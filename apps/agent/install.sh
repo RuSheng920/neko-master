@@ -71,7 +71,7 @@ download_file() {
 }
 
 normalize_os() {
-	raw="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	raw="$(uname -s | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
 	case "$raw" in
 	linux) echo "linux" ;;
 	darwin) echo "darwin" ;;
@@ -83,7 +83,7 @@ normalize_os() {
 }
 
 normalize_arch() {
-	raw="$(uname -m | tr '[:upper:]' '[:lower:]')"
+	raw="$(uname -m | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
 	case "$raw" in
 	x86_64 | amd64) echo "amd64" ;;
 	aarch64 | arm64) echo "arm64" ;;
