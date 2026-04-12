@@ -1,63 +1,78 @@
 import { StatsDatabase } from '../db/db.js';
 import { RetentionConfig, DEFAULT_RETENTION } from './cleanup.types.js';
 
+export interface CleanupOverrides {
+  cleanupInterval?: number;
+  connectionLogsDays?: number;
+  hourlyStatsDays?: number;
+  healthLogDays?: number;
+  autoCleanup?: boolean;
+}
+
 /**
  * Automatic data cleanup service
- * 
+ *
  * Implements tiered data retention:
- * - Raw connection logs: Short term (configurable, default 7 days)
- * - Hourly stats: Medium term (configurable, default 30 days)  
+ * - Minute-level stats: Short term (configurable, default 7 days)
+ * - Hourly stats: Medium term (configurable, default 30 days)
+ * - Backend health logs: Medium term (defaults to hourlyStatsDays, independently overridable)
  * - Daily/domain stats: Long term (permanent, continuously updated)
  */
 export class CleanupService {
   private db: StatsDatabase;
   private cleanupTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
-  private customInterval: number | undefined;
+  private overrides: CleanupOverrides;
 
-  constructor(db: StatsDatabase, config: Partial<RetentionConfig> = {}) {
+  constructor(db: StatsDatabase, overrides: CleanupOverrides = {}) {
     this.db = db;
-    this.customInterval = config.cleanupInterval;
+    this.overrides = overrides;
   }
 
   /**
-   * Get current config from database
+   * Get effective config by merging (in precedence order):
+   * env/constructor overrides > DB config > defaults.
    */
-  private getConfig(): RetentionConfig {
+  private getConfig(): RetentionConfig & { healthLogDays: number } {
     const dbConfig = this.db.getRetentionConfig();
-    return {
+    const merged: RetentionConfig = {
       ...DEFAULT_RETENTION,
       ...dbConfig,
-      // Use custom interval if provided in constructor
-      cleanupInterval: this.customInterval ?? DEFAULT_RETENTION.cleanupInterval,
+      cleanupInterval: this.overrides.cleanupInterval ?? DEFAULT_RETENTION.cleanupInterval,
+    };
+    if (this.overrides.connectionLogsDays !== undefined) merged.connectionLogsDays = this.overrides.connectionLogsDays;
+    if (this.overrides.hourlyStatsDays !== undefined) merged.hourlyStatsDays = this.overrides.hourlyStatsDays;
+    if (this.overrides.autoCleanup !== undefined) merged.autoCleanup = this.overrides.autoCleanup;
+    return {
+      ...merged,
+      healthLogDays: this.overrides.healthLogDays ?? merged.hourlyStatsDays,
     };
   }
 
   /**
-   * Start automatic cleanup scheduling
+   * Start automatic cleanup scheduling.
+   *
+   * The timer is always scheduled so that toggling autoCleanup via the UI
+   * takes effect on the next tick without needing to restart the service.
+   * Each tick re-reads the config and short-circuits if autoCleanup is off.
    */
   start(): void {
-    const config = this.getConfig();
-    
-    if (!config.autoCleanup) {
-      console.log('[Cleanup] Auto-cleanup disabled');
-      return;
-    }
-
     if (this.cleanupTimer) {
       return; // Already running
     }
 
+    const config = this.getConfig();
     console.log(`[Cleanup] Starting with retention policy:`, {
-      connectionLogs: `${config.connectionLogsDays} days`,
+      autoCleanup: config.autoCleanup,
+      minuteStats: `${config.connectionLogsDays} days`,
       hourlyStats: `${config.hourlyStatsDays} days`,
+      healthLogs: `${config.healthLogDays} days`,
       interval: `${config.cleanupInterval} hours`,
     });
 
-    // Run initial cleanup
+    // Run initial cleanup immediately so upgrading users see the effect at boot.
     this.runCleanup();
 
-    // Schedule periodic cleanup
     const intervalMs = config.cleanupInterval * 60 * 60 * 1000;
     this.cleanupTimer = setInterval(() => {
       this.runCleanup();
@@ -79,6 +94,11 @@ export class CleanupService {
    * Run cleanup manually
    */
   async runCleanup(): Promise<void> {
+    const config = this.getConfig();
+    if (!config.autoCleanup) {
+      return;
+    }
+
     if (this.isRunning) {
       console.log('[Cleanup] Previous cleanup still running, skipping');
       return;
@@ -88,13 +108,13 @@ export class CleanupService {
     const startTime = Date.now();
 
     try {
-      // Clean up old connection logs
+      // Clean up old minute-level stats
       const logsDeleted = this.cleanupConnectionLogs();
 
       // Clean up old hourly stats
       const hourlyDeleted = this.cleanupHourlyStats();
 
-      // Clean up old health logs (same retention as hourly stats)
+      // Clean up old health logs (independently overridable, defaults to hourlyStatsDays)
       this.cleanupHealthLogs();
 
       // Vacuum database to reclaim space (only if significant data deleted)
@@ -126,11 +146,11 @@ export class CleanupService {
   }
 
   /**
-   * Clean up old health logs (retention matches hourly stats)
+   * Clean up old health logs (uses healthLogDays override, falling back to hourlyStatsDays)
    */
   private cleanupHealthLogs(): void {
     const config = this.getConfig();
-    this.db.repos.health.pruneOldLogs(config.hourlyStatsDays);
+    this.db.repos.health.pruneOldLogs(config.healthLogDays);
   }
 
   /**
@@ -167,14 +187,15 @@ export class CleanupService {
       hourlyStatsDays: config.hourlyStatsDays,
       autoCleanup: config.autoCleanup,
     });
-    
+
     // Handle interval change
     if (config.cleanupInterval !== undefined) {
-      this.customInterval = config.cleanupInterval;
+      this.overrides.cleanupInterval = config.cleanupInterval;
     }
-    
-    // Restart if interval changed or autoCleanup was toggled
-    if ((config.cleanupInterval !== undefined || config.autoCleanup !== undefined) && this.cleanupTimer) {
+
+    // Restart only when the tick interval changed — autoCleanup is re-evaluated
+    // on every tick now, so toggling it doesn't require a restart.
+    if (config.cleanupInterval !== undefined && this.cleanupTimer) {
       this.stop();
       this.start();
     }

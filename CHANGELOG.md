@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [1.3.7] - 2026-04-12
+
+### 修复
+
+- **SQLite 数据保留策略静默失效** 🐛 ([#66](https://github.com/foru17/neko-master/issues/66))
+  - 修复全新安装的实例默认 `autoCleanup` 为 `false` 的 bug：`app_config` 表无配置行时读取返回 `false`，与代码声明的默认值 `true` 不一致，导致 minute 级和 hourly 级统计表从未被清理
+  - 修复 `backend_health_logs` 从未被清理：启动流程使用的是内联 `runAutoCleanup`，只清 `minute_*` / `hourly_*`，真正包含健康日志清理的 `CleanupService` 从未被实例化
+  - 修复 UI 切换 `autoCleanup` 开关不生效：`CleanupService.start()` 在 `autoCleanup=false` 时早退，定时器未挂起，后续切换无效
+  - 新增环境变量覆盖：`SQLITE_RETENTION_MINUTE_DAYS` / `SQLITE_RETENTION_HOURLY_DAYS` / `SQLITE_RETENTION_HEALTH_LOG_DAYS`，便于 Docker Compose 用户 set-and-forget
+  - 感谢 @airobot-bot 提供的详细行级统计数据
+
+- **编辑后端时 URL 被静默重建** 🐛 ([#65](https://github.com/foru17/neko-master/issues/65))
+  - 修复更新后端任何字段（包括只改密钥）时 URL 被强制重建的 bug：前端编辑表单只保留 `host` / `port` / `ssl`，保存时用 `buildDirectUrl` 重建，丢掉原 URL 中的 path / query / embedded credentials
+  - 修复方式：当 `host` / `port` / `ssl` 未被修改时，保留原始 URL 原样提交
+  - Collector 后端日志增强：重启时打印具体变更字段（如 `changed: token`），便于用户自证重启逻辑触发
+  - 感谢 @yuhongwei380 的报告
+
 ## [1.3.6] - 2026-03-26
 
 ### 修复

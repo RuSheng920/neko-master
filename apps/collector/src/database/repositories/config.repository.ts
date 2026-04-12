@@ -63,7 +63,8 @@ export class ConfigRepository extends BaseRepository {
     return {
       connectionLogsDays: parseInt(connectionLogsDays?.value || '7', 10),
       hourlyStatsDays: parseInt(hourlyStatsDays?.value || '30', 10),
-      autoCleanup: autoCleanup?.value === '1',
+      // Default ON when no row exists; an explicit '0' disables it.
+      autoCleanup: autoCleanup ? autoCleanup.value !== '0' : true,
     };
   }
 

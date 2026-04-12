@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.7] - 2026-04-12
+
+### Fixed
+
+- **SQLite retention policy silently disabled** 🐛 ([#66](https://github.com/foru17/neko-master/issues/66))
+  - Fixed `autoCleanup` defaulting to `false` on fresh installs: when no row exists in `app_config`, the DB read returned `false` instead of the declared default `true`, so minute-level and hourly stats tables were never pruned
+  - Fixed `backend_health_logs` never being cleaned up: the startup flow used an inline `runAutoCleanup` that only covered `minute_*` / `hourly_*` tables; the real `CleanupService` (which handles health logs) was never instantiated
+  - Fixed UI autoCleanup toggle not taking effect: `CleanupService.start()` used to early-return when `autoCleanup=false`, so the timer was never scheduled and subsequent toggles had no effect
+  - Added env-var overrides: `SQLITE_RETENTION_MINUTE_DAYS` / `SQLITE_RETENTION_HOURLY_DAYS` / `SQLITE_RETENTION_HEALTH_LOG_DAYS` for set-and-forget Docker Compose deployments
+  - Thanks to @airobot-bot for the detailed row-level measurements
+
+- **Backend URL silently rewritten on edit** 🐛 ([#65](https://github.com/foru17/neko-master/issues/65))
+  - Fixed an issue where editing any field of a backend (including token-only changes) would rebuild the URL from `host` / `port` / `ssl`, silently dropping any path, query string, or embedded credentials present in the original URL
+  - Fix: when `host` / `port` / `ssl` haven't been touched, the original URL is preserved as-is
+  - Collector now logs the specific fields that changed when restarting a collector (e.g. `changed: token`), so users can self-verify from logs that the reconcile loop picked up their change
+  - Thanks to @yuhongwei380 for the report
+
 ## [1.3.6] - 2026-03-26
 
 ### Fixed

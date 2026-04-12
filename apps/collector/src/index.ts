@@ -31,10 +31,34 @@ import {
   loadClickHouseConfig,
 } from './modules/clickhouse/clickhouse.config.js';
 import { ClickHouseCompareService } from './modules/clickhouse/clickhouse.compare.js';
+import { CleanupService, type CleanupOverrides } from './modules/cleanup/index.js';
 
 const COLLECTOR_WS_PORT = parseInt(process.env.COLLECTOR_WS_PORT || '3002');
 const API_PORT = parseInt(process.env.API_PORT || '3001');
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'stats.db');
+
+/**
+ * Parse an integer retention env var. Returns undefined for unset/invalid values
+ * so the service falls back to the DB-stored config or built-in defaults.
+ */
+function parseRetentionEnvDays(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    console.warn(`[Cleanup] Ignoring invalid ${name}=${raw} (expected positive integer)`);
+    return undefined;
+  }
+  return parsed;
+}
+
+function loadCleanupOverridesFromEnv(): CleanupOverrides {
+  return {
+    connectionLogsDays: parseRetentionEnvDays('SQLITE_RETENTION_MINUTE_DAYS'),
+    hourlyStatsDays: parseRetentionEnvDays('SQLITE_RETENTION_HOURLY_DAYS'),
+    healthLogDays: parseRetentionEnvDays('SQLITE_RETENTION_HEALTH_LOG_DAYS'),
+  };
+}
 
 // Map of backend connections: backendId -> GatewayCollector | SurgeCollector
 const collectors = new Map<number, GatewayCollector | SurgeCollector>();
@@ -44,6 +68,7 @@ let apiServer: APIServer;
 let geoService: GeoIPService;
 let policySyncService: SurgePolicySyncService;
 let clickHouseCompareService: ClickHouseCompareService;
+let cleanupService: CleanupService | undefined;
 
 // Track last known backend configs to detect changes
 let lastBackendConfigs: Map<number, BackendConfig> = new Map();
@@ -108,29 +133,10 @@ async function main() {
   // Check for backend config changes every 5 seconds
   setInterval(manageBackends, 5000);
 
-  // Auto-cleanup: enforce data retention policy
-  function runAutoCleanup() {
-    try {
-      const config = db.getRetentionConfig();
-      if (!config.autoCleanup) return;
-
-      const connCutoff = new Date(Date.now() - config.connectionLogsDays * 86400000).toISOString();
-      const hourlyCutoff = new Date(Date.now() - config.hourlyStatsDays * 86400000).toISOString();
-
-      const deletedLogs = db.deleteOldMinuteStats(connCutoff);
-      const deletedHourly = db.deleteOldHourlyStats(hourlyCutoff);
-
-      if (deletedLogs > 0 || deletedHourly > 0) {
-        console.log(`[Cleanup] Deleted ${deletedLogs} connection logs, ${deletedHourly} hourly stats`);
-      }
-    } catch (err) {
-      console.error('[Cleanup] Auto-cleanup failed:', err);
-    }
-  }
-
-  // First cleanup 30 seconds after startup, then every 6 hours
-  setTimeout(runAutoCleanup, 30000);
-  setInterval(runAutoCleanup, 6 * 60 * 60 * 1000);
+  // Start the retention cleanup service. Env vars (SQLITE_RETENTION_*) override
+  // the DB-stored config for operators who prefer set-and-forget Docker deploys.
+  cleanupService = new CleanupService(db, loadCleanupOverridesFromEnv());
+  cleanupService.start();
 
   // Handle graceful shutdown
   process.on('SIGINT', shutdown);
@@ -152,16 +158,20 @@ async function manageBackends() {
 
       // Check if we need to start or restart this backend connection
       const needsStart = backend.listening && backend.enabled && !existingCollector && !isAgentBackend;
-      const needsRestart = existingCollector && lastConfig && (
-        lastConfig.url !== backend.url ||
-        lastConfig.token !== backend.token ||
-        lastConfig.type !== backend.type ||
-        lastConfig.listening !== backend.listening ||
-        lastConfig.enabled !== backend.enabled
-      );
+      const changedFields: string[] = [];
+      if (existingCollector && lastConfig) {
+        if (lastConfig.url !== backend.url) changedFields.push('url');
+        if (lastConfig.token !== backend.token) changedFields.push('token');
+        if (lastConfig.type !== backend.type) changedFields.push('type');
+        if (lastConfig.listening !== backend.listening) changedFields.push('listening');
+        if (lastConfig.enabled !== backend.enabled) changedFields.push('enabled');
+      }
+      const needsRestart = changedFields.length > 0;
 
       if (needsRestart) {
-        console.log(`[Backends] Restarting collector for backend "${backend.name}" (ID: ${backend.id}) due to config change`);
+        console.log(
+          `[Backends] Restarting collector for backend "${backend.name}" (ID: ${backend.id}) — changed: ${changedFields.join(', ')}`,
+        );
         stopCollector(backend.id);
       }
 
@@ -289,6 +299,9 @@ function shutdown() {
   apiServer?.stop();
   clickHouseCompareService?.stop();
   geoService?.destroy();
+
+  // Stop retention cleanup
+  cleanupService?.stop();
 
   // Close database
   db?.close();

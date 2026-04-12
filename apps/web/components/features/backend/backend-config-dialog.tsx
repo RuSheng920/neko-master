@@ -1078,11 +1078,27 @@ export function BackendConfigDialog({
 
     setLoading(true);
     try {
-      const url = isAgentMode
-        ? current && isAgentBackendUrl(current.url)
-          ? current.url
-          : buildAgentUrl(generateAgentMarker(name))
-        : buildDirectUrl(editFormData.host, editFormData.port, editFormData.ssl);
+      // Preserve the original URL when host/port/ssl haven't been touched.
+      // Rebuilding via buildDirectUrl would silently drop any path, query, or
+      // embedded credentials present in the original URL — see issue #65.
+      let url: string;
+      if (isAgentMode) {
+        url =
+          current && isAgentBackendUrl(current.url)
+            ? current.url
+            : buildAgentUrl(generateAgentMarker(name));
+      } else if (current && !isAgentBackendUrl(current.url)) {
+        const parsed = parseBackendUrl(current.url);
+        const hostUnchanged = parsed.host === editFormData.host.trim();
+        const portUnchanged = parsed.port === editFormData.port.trim();
+        const sslUnchanged = parsed.ssl === editFormData.ssl;
+        url =
+          hostUnchanged && portUnchanged && sslUnchanged
+            ? current.url
+            : buildDirectUrl(editFormData.host, editFormData.port, editFormData.ssl);
+      } else {
+        url = buildDirectUrl(editFormData.host, editFormData.port, editFormData.ssl);
+      }
       await api.updateBackend(id, {
         name,
         url,
