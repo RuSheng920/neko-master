@@ -1,10 +1,10 @@
 name: Build Android Agent
 
-于:
+on:
   push:
-    标签:
+    tags:
       - 'agent-v*'
-  # 💡 增加手动触发开关
+  # 开启手动触发
   workflow_dispatch:
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
           cd apps/agent
           GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$workdir/neko-agent" .
 
-          # 2. 注入 nekoagent 脚本 (EOF 内部已修正)
+          # 2. 注入 nekoagent 脚本
           cat <<'EOF' > "$workdir/nekoagent"
 #!/usr/bin/env sh
 set -eu
@@ -74,20 +74,18 @@ EOF
           # 3. 打包
           cd "$workdir"
           sha256sum neko-agent nekoagent > checksums.txt
-          # 动态命名：如果是 tag 触发就用 tag 名，手动触发就用 manual
+          # 使用环境变量，如果不是 tag 触发则默认为 manual
           REL_NAME="${GITHUB_REF_NAME:-manual}"
           tar -czf "../../dist/release/neko-agent-android-arm64-${REL_NAME}.tar.gz" .
 
       - name: Create Release
-        # 仅在有 Tag 时创建 GitHub Release，手动触发仅作为构建测试（或者你可以删掉 if 始终创建）
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          文件: dist/release/*.tar.gz
+          files: dist/release/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 💡 如果是手动触发，将文件上传到 Actions Artifacts (方便直接下载而不创建 Release)
       - name: Upload Artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
