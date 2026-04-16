@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - 'agent-v*'
-  # 开启手动触发
   workflow_dispatch:
 
 jobs:
@@ -26,11 +25,12 @@ jobs:
           workdir="dist/pkg"
           mkdir -p "$workdir"
           
-          # 1. 编译 (针对安卓 arm64)
+          # 1. 编译针对安卓 arm64 的二进制
           cd apps/agent
-          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$workdir/neko-agent" .
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "../../$workdir/neko-agent" .
+          cd ../../
 
-          # 2. 注入 nekoagent 脚本
+          # 2. 写入安卓适配脚本 (注意这里 EOF 的缩进)
           cat <<'EOF' > "$workdir/nekoagent"
 #!/usr/bin/env sh
 set -eu
@@ -74,7 +74,6 @@ EOF
           # 3. 打包
           cd "$workdir"
           sha256sum neko-agent nekoagent > checksums.txt
-          # 使用环境变量，如果不是 tag 触发则默认为 manual
           REL_NAME="${GITHUB_REF_NAME:-manual}"
           tar -czf "../../dist/release/neko-agent-android-arm64-${REL_NAME}.tar.gz" .
 
