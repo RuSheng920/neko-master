@@ -1,100 +1,80 @@
-- name: Build archive
+name: Build and Release Agent
+
+on:
+  push:
+    tags:
+      - 'agent-v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: arm64 # 适配你的 OnePlus Ace 3V
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build archive
         run: |
           set -eu
           mkdir -p dist/release
           workdir="dist/pkg"
-          rm -rf "$workdir" && mkdir -p "$workdir"
+          mkdir -p "$workdir"
           
-          # 1. 进入源码目录并编译核心二进制
+          # 1. 编译二进制
           cd apps/agent
-          go build -trimpath $EXTRA_FLAGS \
-            -ldflags "-s -w -X github.com/foru17/neko-master/apps/agent/internal/config.AgentVersion=${VERSION_PLAIN}" \
-            -o "$workdir/neko-agent" .
+          go build -trimpath -ldflags "-s -w" -o "$workdir/neko-agent" .
 
-          # 2. 在打包过程中直接写入我们适配好的安卓版 nekoagent 脚本
-          # 这样可以确保输出的压缩包直接就是安卓可用的，不需要手动再去改
+          # 2. 注入你要求的 agent.conf 适配版脚本
           cat <<'EOF' > "$workdir/nekoagent"
 #!/usr/bin/env sh
-# Neko Agent Manager for Android (Magisk)
 set -eu
-
 PROG="nekoagent"
 AGENT_BIN="/system/bin/neko-agent"
 BASE_DIR="/data/adb/neko-agent"
-DEFAULT_CONF="$BASE_DIR/agent.conf"
 STATE_DIR="$BASE_DIR/run"
-VERSION="0.2.3-android"
-
-log() { printf '[%s] %s\n' "$PROG" "$1"; }
-err() { printf '[%s] error: %s\n' "$PROG" "$1" >&2; }
 
 ensure_dirs() { mkdir -p "$BASE_DIR" "$STATE_DIR"; }
-
-pid_file() { printf '%s/%s.pid\n' "$STATE_DIR" "$1"; }
-log_file() { printf '%s/%s.log\n' "$STATE_DIR" "$1"; }
-
-is_running() {
-  pf="$(pid_file "$1")"
-  [ ! -f "$pf" ] && return 1
-  pid="$(cat "$pf" 2>/dev/null || true)"
-  [ -z "$pid" ] && return 1
-  kill -0 "$pid" >/dev/null 2>&1
-}
-
 load_config() {
-  conf_path="$1"
-  [ ! -f "$conf_path" ] && { err "配置文件未找到: $conf_path"; exit 1; }
-  config_raw=$(grep -v '^#' "$conf_path" | grep '=')
-  eval "$(echo "$config_raw" | sed 's/ *= */=/g' | awk -F= '{print "NEKO_" toupper($1) "=" $2}')"
+  conf="$BASE_DIR/${1:-agent}.conf"
+  [ -f "$conf" ] || { echo "Error: $conf not found"; exit 1; }
+  eval "$(grep -v '^#' "$conf" | grep '=' | sed 's/ *= */=/g' | awk -F= '{print "NEKO_" toupper($1) "=" $2}')"
 }
 
-build_agent_args() {
-  [ -z "${NEKO_SERVER_URL:-}" ] && { err "配置中缺少 server_url"; exit 1; }
-  set -- --server-url "$NEKO_SERVER_URL" --backend-id "$NEKO_BACKEND_ID" \
-         --backend-token "$NEKO_BACKEND_TOKEN" --gateway-type "$NEKO_GATEWAY_TYPE" \
-         --gateway-url "$NEKO_GATEWAY_URL"
-  [ -n "${NEKO_GATEWAY_TOKEN:-}" ] && set -- "$@" --gateway-token "$NEKO_GATEWAY_TOKEN"
-  [ -n "${NEKO_LOG:-}" ] && set -- "$@" --log="$NEKO_LOG"
-  [ -n "${NEKO_AGENT_ID:-}" ] && set -- "$@" --agent-id "$NEKO_AGENT_ID"
-  printf '%s\n' "$*"
-}
-
-main() {
-  cmd="$1"; shift
-  case "$cmd" in
-    start)
-      name="${1:-agent}"; conf_target="$BASE_DIR/${name}.conf"
-      ensure_dirs
-      is_running "$name" && { log "实例 '$name' 运行中"; exit 0; }
-      load_config "$conf_target"
-      args="$(build_agent_args)"
-      nohup "$AGENT_BIN" $args >> "$(log_file "$name")" 2>&1 &
-      printf '%s\n' "$!" > "$(pid_file "$name")"
-      log "实例 '$name' 已启动"
-      ;;
-    stop)
-      name="${1:-agent}"; pf="$(pid_file "$name")"
-      if is_running "$name"; then
-        kill "$(cat "$pf")" >/dev/null 2>&1 || true
-        sleep 1
-        rm -f "$pf"
-        log "实例 '$name' 已停止"
-      fi
-      ;;
-    status)
-      is_running "${1:-agent}" && { log "运行中"; exit 0; } || { log "停止"; exit 1; }
-      ;;
-    logs) tail -f "$(log_file "${1:-agent}")" ;;
-    *) echo "Usage: nekoagent {start|stop|status|logs} [name]" ;;
-  esac
-}
-main "$@"
+case "$1" 在
+  start)
+    ensure_dirs
+    load_config "${2:-agent}"
+    args="--server-url $NEKO_SERVER_URL --backend-id $NEKO_BACKEND_ID --backend-token $NEKO_BACKEND_TOKEN --gateway-type $NEKO_GATEWAY_TYPE --gateway-url $NEKO_GATEWAY_URL"
+    nohup "$AGENT_BIN" $args >> "$STATE_DIR/${2:-agent}.log" 2>&1 &
+    echo $! > "$STATE_DIR/${2:-agent}.pid"
+    echo "Started."
+    ;;
+  stop)
+    pid_f="$STATE_DIR/${2:-agent}.pid"
+    [ -f "$pid_f" ] && kill $(cat "$pid_f") && rm "$pid_f" && echo "Stopped."
+    ;;
+  *) echo "Usage: nekoagent {start|stop} [name]" ;;
+esac
 EOF
-
-          # 3. 赋予执行权限
           chmod +x "$workdir/nekoagent"
 
-          # 4. 生成校验和并打包
+          # 3. 打包
           cd "$workdir"
-          sha256sum neko-agent nekoagent > checksums.txt
-          tar -czf "../../dist/release/neko-agent_${VERSION}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" .
+          tar -czf "../../dist/release/neko-agent-android-${{ matrix.arch }}.tar.gz" .
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/release/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
