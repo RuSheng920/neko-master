@@ -3,7 +3,9 @@ name: Build Android Agent
 on:
   push:
     tags:
-      - 'agent-v*' # 只有当你推送到 agent-v 开头的标签时才触发
+      - 'agent-v*'
+  # 💡 增加手动触发开关
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,11 +26,11 @@ jobs:
           workdir="dist/pkg"
           mkdir -p "$workdir"
           
-          # 1. 编译针对安卓 arm64 的核心程序
+          # 1. 编译 (针对安卓 arm64)
           cd apps/agent
           GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$workdir/neko-agent" .
 
-          # 2. 注入我们修改好的 .conf 适配版 nekoagent 脚本
+          # 2. 注入 nekoagent 脚本 (EOF 内部已修正)
           cat <<'EOF' > "$workdir/nekoagent"
 #!/usr/bin/env sh
 set -eu
@@ -41,7 +43,7 @@ ensure_dirs() { mkdir -p "$BASE_DIR" "$STATE_DIR"; }
 
 load_config() {
   conf="$BASE_DIR/${1:-agent}.conf"
-  [ -f "$conf" ] || { echo "Error: $conf not found"; exit 1; }
+  if [ ! -f "$conf" ]; then echo "Error: $conf not found"; exit 1; fi
   config_raw=$(grep -v '^#' "$conf" | grep '=')
   eval "$(echo "$config_raw" | sed 's/ *= */=/g' | awk -F= '{print "NEKO_" toupper($1) "=" $2}')"
 }
@@ -58,25 +60,37 @@ case "$1" 在
     ;;
   stop)
     pid_f="$STATE_DIR/${2:-agent}.pid"
-    [ -f "$pid_f" ] && kill $(cat "$pid_f") && rm "$pid_f" && echo "Stopped."
+    if [ -f "$pid_f" ]; then kill $(cat "$pid_f") && rm "$pid_f" && echo "Stopped."; fi
     ;;
   status)
     pid_f="$STATE_DIR/${2:-agent}.pid"
-    [ -f "$pid_f" ] && kill -0 $(cat "$pid_f") 2>/dev/null && echo "Running" || echo "Stopped"
+    if [ -f "$pid_f" ] && kill -0 $(cat "$pid_f") 2>/dev/null; then echo "Running"; else echo "Stopped"; fi
     ;;
   *) echo "Usage: nekoagent {start|stop|status} [name]" ;;
 esac
 EOF
           chmod +x "$workdir/nekoagent"
 
-          # 3. 打包并生成校验码
+          # 3. 打包
           cd "$workdir"
           sha256sum neko-agent nekoagent > checksums.txt
-          tar -czf "../../dist/release/neko-agent-android-arm64.tar.gz" .
+          # 动态命名：如果是 tag 触发就用 tag 名，手动触发就用 manual
+          REL_NAME="${GITHUB_REF_NAME:-manual}"
+          tar -czf "../../dist/release/neko-agent-android-arm64-${REL_NAME}.tar.gz" .
 
       - name: Create Release
+        # 仅在有 Tag 时创建 GitHub Release，手动触发仅作为构建测试（或者你可以删掉 if 始终创建）
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/release/neko-agent-android-arm64.tar.gz
+          files: dist/release/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 💡 如果是手动触发，将文件上传到 Actions Artifacts (方便直接下载而不创建 Release)
+      - name: Upload Artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: neko-agent-android-arm64
+          path: dist/release/*.tar.gz
